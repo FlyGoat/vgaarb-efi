@@ -25,12 +25,38 @@
 #define PCI_HEADER_TYPE_BRIDGE  0x01    // PCI-to-PCI bridge
 #define PCI_HEADER_TYPE_MASK    0x7F    // Mask for header type
 
-// Function prototype for recursive bridge programming - Updated to use device handle
-EFI_STATUS
-EnableVgaDecodingRecursively(
-    IN EFI_HANDLE DeviceHandle,
-    IN BOOLEAN Enable
-);
+#define MAX_VGA_DEVICES 10
+
+CHAR16 *
+PciIoToSBDFStr(
+    IN EFI_PCI_IO_PROTOCOL *PciIo
+)
+{
+    EFI_STATUS Status;
+    UINTN Segment, Bus, Device, Function;
+            
+    // Get device location
+    Status = uefi_call_wrapper(PciIo->GetLocation, 5,
+        PciIo,
+        &Segment,
+        &Bus,
+        &Device,
+        &Function
+    );
+    if (EFI_ERROR(Status)) {
+        return L"UNKNOWN";
+    }
+    // Format into a string
+    CHAR16 *Buffer = AllocateZeroPool(32 * sizeof(CHAR16));
+    if (Buffer == NULL) {
+        return L"UNKNOWN";
+    }
+
+    SPrint(Buffer, 32 * sizeof(CHAR16), L"%04X:%02X:%02X.%01X", 
+        (UINT16)Segment, (UINT8)Bus, (UINT8)Device, (UINT8)Function);
+    
+    return Buffer;
+}
 
 // Function to determine if a device is a VGA-compatible device
 BOOLEAN
@@ -51,6 +77,8 @@ IsVgaDevice(
     );
     
     if (EFI_ERROR(Status)) {
+        Print(L"IsVgaDevice: Failed to read class code: %r for %s\n", Status,
+            PciIoToSBDFStr(PciIo));
         return FALSE;
     }
     
@@ -69,7 +97,7 @@ EnableVgaOnBridge(
 )
 {
     EFI_STATUS Status;
-    UINT16 BridgeControl;
+    UINT16 BridgeControl, BridgeControlOrig;
     
     // Read current Bridge Control register
     Status = uefi_call_wrapper(PciIo->Pci.Read, 5,
@@ -81,9 +109,12 @@ EnableVgaOnBridge(
     );
     
     if (EFI_ERROR(Status)) {
+        Print(L"EnableVgaOnBridge: Failed to read Bridge Control: %r\n", Status);
         return Status;
     }
-    
+
+    BridgeControlOrig = BridgeControl;
+
     // Modify VGA Enable bit
     if (Enable) {
         BridgeControl |= PCI_BRIDGE_CTL_VGA;  // Enable VGA
@@ -99,6 +130,28 @@ EnableVgaOnBridge(
         1,
         &BridgeControl
     );
+
+    if (EFI_ERROR(Status)) {
+        Print(L"EnableVgaOnBridge: Failed to write Bridge Control: %r\n", Status);
+        return Status;
+    }
+
+    // Read back to verify
+    Status = uefi_call_wrapper(PciIo->Pci.Read, 5,
+        PciIo,
+        EfiPciIoWidthUint16,
+        PCI_BRIDGE_CONTROL,
+        1,
+        &BridgeControl
+    );
+
+    if (EFI_ERROR(Status)) {
+        Print(L"EnableVgaOnBridge: Failed to read back Bridge Control: %r\n", Status);
+        return Status;
+    }
+
+    Print(L"EnableVgaOnBridge: %s, Enable = %d, BridgeControl: %04X -> %04X\n", 
+        PciIoToSBDFStr(PciIo), !!Enable, BridgeControlOrig, BridgeControl);
     
     return Status;
 }
@@ -123,6 +176,7 @@ IsPciBridge(
     );
     
     if (EFI_ERROR(Status)) {
+        Print(L"IsPciBridge: Failed to read header type: %r\n", Status);
         return FALSE;
     }
     
@@ -136,6 +190,7 @@ IsPciBridge(
     );
     
     if (EFI_ERROR(Status)) {
+        Print(L"IsPciBridge: Failed to read class code: %r\n", Status);
         return FALSE;
     }
     
@@ -149,23 +204,47 @@ IsPciBridge(
             SubClass == PCI_SUBCLASS_PCI_BRIDGE);
 }
 
+CHAR16 *
+DeviceHandleToPathStr(
+    IN EFI_HANDLE DeviceHandle
+)
+{
+    CHAR16 *UNKSTR = L"UNKNOWN";
+    CHAR16 *DevicePathStr = UNKSTR;
+    EFI_DEVICE_PATH *DevicePath = NULL;
+    
+    DevicePath = DevicePathFromHandle(DeviceHandle);
+    if (DevicePath == NULL) {
+        return UNKSTR;
+    }
+    
+    // Convert device path to string
+    DevicePathStr = DevicePathToStr(DevicePath);
+    if (DevicePathStr == NULL) {
+        return UNKSTR;
+    }
+    
+    return DevicePathStr;
+}
+
 // Recursively enable VGA decoding up through the parent bridges
-// Updated to use EFI_HANDLE instead of PciIo directly
 EFI_STATUS
-EnableVgaDecodingRecursively(
+EnableVgaDecodingRecursive(
     IN EFI_HANDLE DeviceHandle,
     IN BOOLEAN Enable
 )
 {
     EFI_STATUS Status;
-    UINT16 Command;
     EFI_DEVICE_PATH_PROTOCOL *DevicePath;
     EFI_DEVICE_PATH_PROTOCOL *ParentPath;
     EFI_PCI_IO_PROTOCOL *PciIo;
     EFI_HANDLE ParentHandle;
     EFI_GUID PciIoGuid = EFI_PCI_IO_PROTOCOL_GUID;
     EFI_GUID DevicePathGuid = EFI_DEVICE_PATH_PROTOCOL_GUID;
-    
+
+    Print(L"EnableVgaDecodingRecursive: %s, Enable=%d\n", 
+          DeviceHandleToPathStr(DeviceHandle), Enable);
+
     // Get the PCI IO protocol for this handle
     Status = uefi_call_wrapper(BS->HandleProtocol, 3,
         DeviceHandle,
@@ -176,36 +255,7 @@ EnableVgaDecodingRecursively(
     if (EFI_ERROR(Status) || PciIo == NULL) {
         return Status;
     }
-    
-    // Enable I/O, Memory and Bus Master on the device itself
-    Status = uefi_call_wrapper(PciIo->Pci.Read, 5,
-        PciIo,
-        EfiPciIoWidthUint16,
-        PCI_COMMAND,
-        1,
-        &Command
-    );
-    
-    if (EFI_ERROR(Status)) {
-        return Status;
-    }
-    
-    if (Enable) {
-        Command |= (PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
-    }
-    
-    Status = uefi_call_wrapper(PciIo->Pci.Write, 5,
-        PciIo,
-        EfiPciIoWidthUint16,
-        PCI_COMMAND,
-        1,
-        &Command
-    );
-    
-    if (EFI_ERROR(Status)) {
-        return Status;
-    }
-    
+
     // Get the device path of this device
     Status = uefi_call_wrapper(BS->HandleProtocol, 3,
         DeviceHandle,
@@ -214,6 +264,7 @@ EnableVgaDecodingRecursively(
     );
     
     if (EFI_ERROR(Status) || DevicePath == NULL) {
+        Print(L"Failed to get device path: %r\n", Status);
         return Status;
     }
     
@@ -253,11 +304,128 @@ EnableVgaDecodingRecursively(
         
         if (!EFI_ERROR(Status)) {
             // Recursively enable VGA decoding on the parent
-            Status = EnableVgaDecodingRecursively(ParentHandle, Enable);
+            Status = EnableVgaDecodingRecursive(ParentHandle, Enable);
         }
     }
     
     return EFI_SUCCESS;
+}
+
+EFI_STATUS
+EnableVgaAttributes(
+    IN EFI_PCI_IO_PROTOCOL *PciIo
+)
+{
+    EFI_STATUS Status;
+    UINT64 Supported;
+    UINT64 Attributes = 0;
+    BOOLEAN unsupported = FALSE;
+    
+    // Read the current command register
+    Status = uefi_call_wrapper(PciIo->Attributes, 5,
+        PciIo,
+        EfiPciIoAttributeOperationSupported,
+        0,
+        &Supported
+    );
+
+    if (EFI_ERROR(Status)) {
+        Print(L"EnableVgaAttributes: Failed to get supported attributes: %r\n", Status);
+        return Status;
+    }
+
+    Attributes = Supported & (EFI_PCI_IO_ATTRIBUTE_VGA_IO | EFI_PCI_IO_ATTRIBUTE_VGA_IO_16);
+
+    if (Attributes == 0) {
+        Print(L"EnableVgaAttributes: No VGA attributes found\n");
+        unsupported = TRUE;
+    } else if (Attributes == (EFI_PCI_IO_ATTRIBUTE_VGA_IO | EFI_PCI_IO_ATTRIBUTE_VGA_IO_16)) {
+        Print(L"EnableVgaAttributes: VGA attributes support\n");
+        Attributes = EFI_PCI_IO_ATTRIBUTE_VGA_IO; // We want to use regular VGA IO
+    }
+
+    if (Supported & EFI_PCI_IO_ATTRIBUTE_VGA_MEMORY) {
+        Attributes |= EFI_PCI_IO_ATTRIBUTE_VGA_MEMORY;
+    } else {
+        Print(L"EnableVgaAttributes: No VGA memory support\n");
+        unsupported = TRUE;
+    }
+
+    // Set the attributes
+    Status = uefi_call_wrapper(PciIo->Attributes, 5,
+        PciIo,
+        EfiPciIoAttributeOperationEnable,
+        Attributes,
+        NULL
+    );
+
+    if (EFI_ERROR(Status)) {
+        Print(L"EnableVgaAttributes: Failed to set attributes: %r\n", Status);
+        return Status;
+    }
+
+    // Read back to verify
+    Status = uefi_call_wrapper(PciIo->Attributes, 5,
+        PciIo,
+        EfiPciIoAttributeOperationGet,
+        0,
+        &Attributes
+    );
+    if (EFI_ERROR(Status)) {
+        Print(L"EnableVgaAttributes: Failed to read back attributes: %r\n", Status);
+        return Status;
+    }
+
+    if (!(Attributes & (EFI_PCI_IO_ATTRIBUTE_VGA_IO | EFI_PCI_IO_ATTRIBUTE_VGA_IO_16))) {
+        Print(L"EnableVgaAttributes: VGA IO not enabled\n");
+        unsupported = TRUE;
+    }
+    if (!(Attributes & EFI_PCI_IO_ATTRIBUTE_VGA_MEMORY)) {
+        Print(L"EnableVgaAttributes: VGA memory not enabled\n");
+        unsupported = TRUE;
+    }
+
+    if (unsupported) {
+        Print(L"EnableVgaAttributes: Unsupported attributes\n");
+        return EFI_UNSUPPORTED;
+    }
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+SelectVgaDevice(
+    IN EFI_HANDLE DeviceHandle
+)
+{
+    EFI_STATUS Status;
+    EFI_PCI_IO_PROTOCOL *PciIo;
+    EFI_GUID PciIoGuid = EFI_PCI_IO_PROTOCOL_GUID;
+
+    // Get the PCI IO protocol for this handle
+    Status = uefi_call_wrapper(BS->HandleProtocol, 3,
+        DeviceHandle,
+        &PciIoGuid,
+        (VOID **)&PciIo
+    );
+    
+    if (EFI_ERROR(Status) || PciIo == NULL) {
+        return Status;
+    }
+
+    Status = EnableVgaAttributes(PciIo);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to enable VGA with attributes: %r\n", Status);
+    } else {
+        Print(L"VGA attributes enabled successfully\n");
+        return EFI_SUCCESS;
+    }
+
+    Print(L"Fallback to EnableVgaDecodingRecursive\n");
+    // Enable VGA decoding on the device
+    Status = EnableVgaDecodingRecursive(DeviceHandle, TRUE);
+    
+    return Status;
 }
 
 // Function to discover and enumerate all VGA devices in the system
@@ -268,6 +436,9 @@ DiscoverAndEnableVgaDevices(VOID)
     EFI_HANDLE *HandleBuffer;
     UINTN HandleCount;
     UINTN Index;
+    UINTN VGADeviceCount = 0;
+    EFI_HANDLE *VGADevices[MAX_VGA_DEVICES];
+    EFI_HANDLE *VGADevice;
     EFI_PCI_IO_PROTOCOL *PciIo;
     EFI_GUID PciIoGuid = EFI_PCI_IO_PROTOCOL_GUID;
     
@@ -299,36 +470,47 @@ DiscoverAndEnableVgaDevices(VOID)
         if (EFI_ERROR(Status)) {
             continue;
         }
+
+        if (IsPciBridge(PciIo)) {
+            // Disable VGA decoding on the bridge
+            Status = EnableVgaOnBridge(PciIo, FALSE);
+            if (EFI_ERROR(Status)) {
+                Print(L"Failed to disable VGA on bridge: %r\n", Status);
+                continue;
+            }
+        }
         
         // Check if this is a VGA device
         if (IsVgaDevice(PciIo)) {
-            UINTN Segment, Bus, Device, Function;
-            
-            // Get device location
-            Status = uefi_call_wrapper(PciIo->GetLocation, 5,
-                PciIo,
-                &Segment,
-                &Bus,
-                &Device,
-                &Function
-            );
-            
-            if (!EFI_ERROR(Status)) {
-                Print(L"Found VGA device at Seg:%d Bus:%d Device:%d Function:%d\n", 
-                     Segment, Bus, Device, Function);
-                
-                // Enable VGA decoding recursively - Now pass the handle instead of PciIo
-                Status = EnableVgaDecodingRecursively(HandleBuffer[Index], TRUE);
-                
-                if (EFI_ERROR(Status)) {
-                    Print(L"Failed to enable VGA decoding: %r\n", Status);
-                } else {
-                    Print(L"Successfully enabled VGA decoding for device\n");
-                }
+            // Store the handle of the VGA device
+            if (VGADeviceCount < MAX_VGA_DEVICES) {
+                VGADevices[VGADeviceCount++] = HandleBuffer[Index];
+            } else {
+                Print(L"Warning: More than %d VGA devices found, ignoring extras\n", MAX_VGA_DEVICES);
+                break;
             }
         }
     }
     
+    if (VGADeviceCount == 0) {
+        Print(L"No VGA devices found\n");
+        goto efi_main_out;
+    }
+
+    VGADevice = VGADevices[0];
+    // Enable VGA decoding on the first VGA device
+
+    Print(L"Found %d VGA devices, taking: %s\n", VGADeviceCount, 
+        DeviceHandleToPathStr(VGADevice));
+
+    Status = SelectVgaDevice(VGADevice);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to select VGA device: %r\n", Status);
+        goto efi_main_out;
+    }
+    
+
+efi_main_out:
     // Free the handle buffer
     uefi_call_wrapper(BS->FreePool, 1, HandleBuffer);
     
