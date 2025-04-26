@@ -1,0 +1,21 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Deps
+      run: sudo apt-get install -y clang lld gnu-efi
+    - name: make
+      run: make
+    - uses: actions/upload-artifact@v4
+      with:
+        name: out
+        path: out
